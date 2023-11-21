@@ -1,0 +1,147 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchsummary import summary
+
+class BidirectionalLSTM(nn.Module):
+    # Inputs hidden units Out
+    def __init__(self, nIn, nHidden, nOut):
+        super(BidirectionalLSTM, self).__init__()
+
+        self.rnn = nn.LSTM(nIn, nHidden, bidirectional=True)
+        self.embedding = nn.Linear(nHidden * 2, nOut)
+
+    def forward(self, input):
+        recurrent, _ = self.rnn(input)
+        T, b, h = recurrent.size()
+
+        print("rec::{}".format(recurrent.shape))
+        t_rec = recurrent.view(T * b, h)
+
+        print("::::{}".format(t_rec.shape))
+
+        output = self.embedding(t_rec)  # [T * b, nOut]
+
+        print("output:{}".format(output.shape))
+        output = output.view(T, b, -1)
+
+        return output
+
+class CRNN(nn.Module):
+    def __init__(self, imgH, nc, nclass, nh, n_rnn=2, leakyRelu=False):
+        super(CRNN, self).__init__()
+        assert imgH % 16 == 0, 'imgH has to be a multiple of 16'
+
+        ks = [3, 3, 3, 3, 3, 3, 2]
+        ps = [1, 1, 1, 1, 1, 1, 0]
+        ss = [1, 1, 1, 1, 1, 1, 1]
+        nm = [64, 128, 256, 256, 512, 512, 512]
+
+        cnn = nn.Sequential()
+
+        def convRelu(i, batchNormalization=False):
+            nIn = nc if i == 0 else nm[i - 1]
+            nOut = nm[i]
+            cnn.add_module('conv{0}'.format(i),
+                           nn.Conv2d(nIn, nOut, ks[i], ss[i], ps[i]))
+            if batchNormalization:
+                cnn.add_module('batchnorm{0}'.format(i), nn.BatchNorm2d(nOut))
+            if leakyRelu:
+                cnn.add_module('relu{0}'.format(i),
+                               nn.LeakyReLU(0.2, inplace=True))
+            else:
+                cnn.add_module('relu{0}'.format(i), nn.ReLU(True))
+
+        convRelu(0)
+        cnn.add_module('pooling{0}'.format(0), nn.MaxPool2d(2, 2))  # 64x16x64
+        convRelu(1)
+        cnn.add_module('pooling{0}'.format(1), nn.MaxPool2d(2, 2))  # 128x8x32
+        convRelu(2, True)
+        convRelu(3)
+        cnn.add_module('pooling{0}'.format(2),
+                       nn.MaxPool2d((2, 2), (2, 1), (0, 1)))  # 256x4x16
+        convRelu(4, True)
+        convRelu(5)
+        cnn.add_module('pooling{0}'.format(3),
+                       nn.MaxPool2d((2, 2), (2, 1), (0, 1)))  # 512x2x16
+        convRelu(6, True)  # 512x1x16
+
+        self.cnn = cnn
+        
+        #self.rnn1 = BidirectionalLSTM(512, nh, nh)
+        #self.rnn2 = BidirectionalLSTM(nh, nh, nclass)
+        
+        self.rnn = nn.Sequential(
+            BidirectionalLSTM(512, nh, nh),
+            BidirectionalLSTM(nh, nh, nclass))
+
+        self.linear = nn.Linear(512,nclass)
+
+        self.softmax = nn.LogSoftmax(dim=2)
+        
+
+    def forward(self, input):
+
+        # conv features
+        conv = self.cnn(input)
+        b, c, h, w = conv.size()
+        x = torch.squeeze(conv,2)
+        x = x.permute(0,2,1)
+        x = self.linear(x)
+        x = x.permute(1,0,2)
+        x = self.softmax(x)
+        return x
+
+        """
+        assert h == 1, "the height of conv must be 1"
+        conv = conv.squeeze(2) # b *512 * width
+        conv = conv.permute(2, 0, 1)  # [w, b, c]
+        print(conv.size())
+        
+        #output = F.log_softmax(self.rnn(conv), dim=2)
+        output = torch.softmax(self.rnn(conv), dim=2)
+        """
+
+
+        """
+        conv = self.rnn1(conv)
+        print(conv.size())
+        conv = self.rnn2(conv)
+        print(conv.size())
+        output = F.log_softmax(conv, dim=2)
+        """
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        m.weight.data.normal_(0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
+
+def get_crnn(config):
+
+    model = CRNN(config.MODEL.IMAGE_SIZE.H, 1, config.MODEL.NUM_CLASSES + 1, config.MODEL.NUM_HIDDEN)
+    model.apply(weights_init)
+
+    return model
+
+if __name__=='__main__':
+    model = CRNN(32,1,13,256).to("cuda")
+    #summary(model,input_size=(1,32,64))
+    print(model)
+    input = torch.randn(1,1,32,64).cuda()
+    out = model(input)
+    print(out.shape)
+    #summary(model,input_size=(1,32,64))
+    
+    
+    """
+    dummy_input = torch.randn(1,1,32,64).cuda()
+    input_names = ["input"]
+    output_names = ["output"]
+    torch.onnx.export(model, dummy_input, "crnn.onnx",
+                      verbose=True, input_names=input_names, output_names=output_names,
+                      do_constant_folding=True, opset_version=11)
+    """

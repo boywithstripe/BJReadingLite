@@ -1,0 +1,4 @@
+center
+num
+index
+r_num
